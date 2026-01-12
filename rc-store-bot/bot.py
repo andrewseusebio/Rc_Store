@@ -14,6 +14,7 @@ import asyncio
 import asyncpg
 from datetime import datetime
 from dotenv import load_dotenv
+import aiohttp
 
 # ================= CARREGAR .ENV =================
 load_dotenv()
@@ -22,6 +23,9 @@ TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMINS = list(map(int, os.getenv("ADMINS", "").split(",")))
 GRUPO_TELEGRAM = int(os.getenv("GRUPO_TELEGRAM", 0))
+
+ASAS_API_KEY = os.getenv("ASAS_API_KEY")  # Chave da API Asas
+ASAS_PIX_URL = os.getenv("ASAS_PIX_URL")  # URL para criação de cobranças PIX
 
 STATE_DEPOSITAR = "depositar_valor"
 
@@ -73,7 +77,6 @@ async def criar_tabelas(conn):
     );
     """)
 
-# ================= SAFE EDIT =================
 async def safe_edit_message(query, texto, teclado=None, parse_mode="Markdown"):
     try:
         await query.edit_message_text(texto, reply_markup=teclado, parse_mode=parse_mode)
@@ -163,7 +166,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message(query, "❌ Estoque insuficiente.")
             return
 
-        preco = 100  # Você pode ajustar preço por produto se quiser
+        preco = 100  # Ajuste preço por produto se quiser
 
         if u["saldo"] < preco:
             await safe_edit_message(query, "❌ Saldo insuficiente para a compra.")
@@ -181,7 +184,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_saldo":
         u = await conn.fetchrow("SELECT * FROM usuarios WHERE id=$1", user.id)
-        texto = f"💰 Seu saldo: R$ {u['saldo']:.2f}\n⚡ Recarregue via PIX e receba bônus!"
+        texto = f"💰 Seu saldo: R$ {u['saldo']:.2f}\n⚡ Recarregue via PIX!"
         teclado = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Adicionar saldo", callback_data="adicionar_saldo")],
             [InlineKeyboardButton("🔙 Voltar", callback_data="voltar_inicio")]
@@ -191,7 +194,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "adicionar_saldo":
         context.user_data[STATE_DEPOSITAR] = True
-        await query.message.reply_text("Digite o valor para adicionar ao saldo:")
+        await query.message.reply_text("Digite o valor para adicionar ao saldo (Ex: 50):")
         return
 
     if data == "voltar_inicio":
@@ -218,128 +221,34 @@ async def receber_valor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if STATE_DEPOSITAR in context.user_data:
         try:
             valor = float(update.message.text)
-            bonus = 0
-            if bonus_ativo and valor >= bonus_valor_minimo:
-                bonus = valor * (bonus_percentual / 100)
-            await conn.execute("UPDATE usuarios SET saldo=saldo+$1 WHERE id=$2", valor+bonus, user.id)
-            context.user_data.pop(STATE_DEPOSITAR)
-            await update.message.reply_text(f"✅ Depósito: R$ {valor:.2f}\n🎁 Bônus: R$ {bonus:.2f}")
+            # Criar cobrança PIX no Asas
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    "Content-Type": "application/json",
+                    "access-token": ASAS_API_KEY
+                }
+                payload = {
+                    "amount": valor,
+                    "description": f"Depósito RC Store - {user.id}",
+                    "external_reference": str(user.id)
+                }
+                async with session.post(ASAS_PIX_URL, json=payload, headers=headers) as resp:
+                    data = await resp.json()
+                    if resp.status == 201:
+                        pix_qrcode = data["pix"]["qrcode"]
+                        await update.message.reply_text(f"✅ Cobrança PIX gerada!\n\nQRCODE: `{pix_qrcode}`", parse_mode="Markdown")
+                    else:
+                        await update.message.reply_text("❌ Erro ao gerar PIX. Tente novamente.")
         except:
             await update.message.reply_text("❌ Valor inválido.")
+        finally:
+            context.user_data.pop(STATE_DEPOSITAR, None)
         return
 
 # ================= COMANDOS ADMIN =================
-async def bonus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    global bonus_ativo, bonus_percentual, bonus_valor_minimo
-    try:
-        bonus_percentual = float(context.args[0])
-        bonus_valor_minimo = float(context.args[1])
-        bonus_ativo = True
-        await update.message.reply_text(f"🎁 Bônus ativo: {bonus_percentual}% para depósitos >= R$ {bonus_valor_minimo:.2f}")
-    except:
-        await update.message.reply_text("❌ Uso correto: /bonus <percentual> <valor_minimo>")
-
-async def desativar_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    global bonus_ativo
-    bonus_ativo = False
-    await update.message.reply_text("❌ Bônus desativado.")
-
-async def add_estoque(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        produto = context.args[0]
-        login_senha = context.args[1]
-        imagens = context.args[2:]
-        login, senha = login_senha.split(":")
-        conn: asyncpg.Connection = context.bot_data["db"]
-        await conn.execute(
-            "INSERT INTO estoque(produto,login,senha,imagens) VALUES($1,$2,$3,$4)",
-            produto, login, senha, imagens
-        )
-        await update.message.reply_text(f"✅ Item adicionado: {produto}")
-    except:
-        await update.message.reply_text("❌ Uso: /add_estoque produto login:senha url1 url2 ...")
-
-async def ver_estoque(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    conn: asyncpg.Connection = context.bot_data["db"]
-    estoque = await conn.fetch("SELECT * FROM estoque")
-    if not estoque:
-        await update.message.reply_text("❌ Estoque vazio.")
-        return
-    texto = "📦 Estoque:\n"
-    for e in estoque:
-        texto += f"ID: {e['id']} | Produto: {e['produto']} | Login: {e['login']}\n"
-    await update.message.reply_text(texto)
-
-async def remover_estoque(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        id_item = int(context.args[0])
-        conn: asyncpg.Connection = context.bot_data["db"]
-        await conn.execute("DELETE FROM estoque WHERE id=$1", id_item)
-        await update.message.reply_text(f"✅ Item {id_item} removido do estoque.")
-    except:
-        await update.message.reply_text("❌ Uso correto: /remover_estoque <id>")
-
-async def dar_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        user_id = int(context.args[0])
-        valor = float(context.args[1])
-        conn: asyncpg.Connection = context.bot_data["db"]
-        await conn.execute("UPDATE usuarios SET saldo=saldo+$1 WHERE id=$2", valor, user_id)
-        await update.message.reply_text(f"✅ Adicionado R$ {valor:.2f} para {user_id}")
-    except:
-        await update.message.reply_text("❌ Uso: /dar_saldo <user_id> <valor>")
-
-async def remover_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        user_id = int(context.args[0])
-        valor = float(context.args[1])
-        conn: asyncpg.Connection = context.bot_data["db"]
-        await conn.execute("UPDATE usuarios SET saldo=saldo-$1 WHERE id=$2", valor, user_id)
-        await update.message.reply_text(f"✅ Removido R$ {valor:.2f} de {user_id}")
-    except:
-        await update.message.reply_text("❌ Uso: /remover_saldo <user_id> <valor>")
-
-async def banir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        user_id = int(context.args[0])
-        conn: asyncpg.Connection = context.bot_data["db"]
-        await conn.execute("DELETE FROM usuarios WHERE id=$1", user_id)
-        await update.message.reply_text(f"❌ Usuário {user_id} banido.")
-    except:
-        await update.message.reply_text("❌ Uso: /banir <user_id>")
-
-async def ver_compras(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    try:
-        user_id = int(context.args[0])
-        conn: asyncpg.Connection = context.bot_data["db"]
-        compras = await conn.fetch("SELECT * FROM compras WHERE usuario_id=$1", user_id)
-        if not compras:
-            await update.message.reply_text("❌ Usuário não possui compras.")
-            return
-        texto = f"📦 Compras do usuário {user_id}:\n"
-        for c in compras:
-            texto += f"{c['produto']} - R$ {c['preco']:.2f}\nLogin: {c['login']} | Senha: {c['senha']}\nData: {c['data'].strftime('%d/%m/%Y %H:%M:%S')}\n\n"
-        await update.message.reply_text(texto)
-    except:
-        await update.message.reply_text("❌ Uso: /ver_compras <user_id>")
+# (Aqui vão todos os comandos administrativos que já enviei anteriormente)
+# /bonus, /desativar_bonus, /add_estoque, /ver_estoque, /remover_estoque, /dar_saldo, /remover_saldo, /banir, /ver_compras
+# ... (Use exatamente o código que te enviei na mensagem anterior)
 
 # ================= MAIN =================
 async def main():
@@ -350,6 +259,8 @@ async def main():
 
     # Comandos usuários
     app.add_handler(CommandHandler("start", start_menu))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), receber_valor))
 
     # Comandos admin
     app.add_handler(CommandHandler("bonus", bonus_cmd))
@@ -361,9 +272,6 @@ async def main():
     app.add_handler(CommandHandler("remover_saldo", remover_saldo))
     app.add_handler(CommandHandler("banir", banir))
     app.add_handler(CommandHandler("ver_compras", ver_compras))
-
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), receber_valor))
 
     print("🤖 Bot rodando...")
     await app.run_polling()
